@@ -119,9 +119,21 @@ def causal_mask(size, device):
     return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
 
 
-def sample_logits(logits, temperature, forbidden):
+def sample_logits(logits, temperature, forbidden, top_k=0, top_p=1.0):
     values = logits.detach().float().clone() / temperature
     values[forbidden] = -float("inf")
+    if top_k and top_k > 0:
+        keep = min(top_k, values.numel())
+        cutoff = torch.topk(values, keep).values[-1]
+        values = torch.where(values < cutoff, torch.full_like(values, -float("inf")), values)
+    if top_p < 1.0:
+        sorted_values, sorted_indices = torch.sort(values, descending=True)
+        sorted_probs = F.softmax(sorted_values, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > top_p
+        remove[1:] = remove[:-1].clone()
+        remove[0] = False
+        values[sorted_indices[remove]] = -float("inf")
     probs = F.softmax(values, dim=-1)
     return int(torch.multinomial(probs, 1).item())
 
@@ -285,14 +297,15 @@ class TwoStageGenerator(nn.Module):
         return self.encoder(ids, pad), pad
 
     @torch.no_grad()
-    def generate_stage1(self, prompt_memory, prompt_pad, temperature):
+    def generate_stage1(self, prompt_memory, prompt_pad, temperature, max_chars=None, top_k=0, top_p=1.0):
         ids = [SANSKRIT_BOS]
         chars = []
         states = []
-        for _ in range(self.stage1_chars):
+        limit = self.stage1_chars if max_chars is None else min(max_chars, self.stage1_chars)
+        for _ in range(limit):
             arr = torch.tensor([ids], dtype=torch.long, device=prompt_memory.device)
             hidden, logits = self.stage1(ids=arr, memory=prompt_memory, memory_pad=prompt_pad)
-            idx = sample_logits(logits[0, -1], temperature, [SANSKRIT_PAD, SANSKRIT_BOS])
+            idx = sample_logits(logits[0, -1], temperature, [SANSKRIT_PAD, SANSKRIT_BOS], top_k, top_p)
             states.append(hidden[:, -1:, :])
             if idx == SANSKRIT_EOS:
                 break
@@ -305,14 +318,26 @@ class TwoStageGenerator(nn.Module):
         return "".join(chars), torch.cat(states, dim=1)
 
     @torch.no_grad()
-    def generate_stage2(self, prompt_ids, stage1_memory, temperature, max_tokens, pad_id, bos_id, eos_id):
+    def soft_stage1_infer(self, prompt_memory, prompt_pad, max_chars):
+        old_len = self.train_stage1_chars
+        try:
+            self.train_stage1_chars = max_chars
+            return self.soft_stage1(prompt_memory, prompt_pad)
+        finally:
+            self.train_stage1_chars = old_len
+
+    @torch.no_grad()
+    def generate_stage2(self, prompt_ids, stage1_memory, temperature, max_tokens, min_tokens, pad_id, bos_id, eos_id, top_k=0, top_p=1.0):
         ids = [bos_id] + prompt_ids
         generated = []
         for _ in range(max_tokens):
             arr = torch.tensor([ids], dtype=torch.long, device=stage1_memory.device)
             pad = torch.tensor([[x == pad_id for x in ids]], dtype=torch.bool, device=stage1_memory.device)
             _, logits = self.stage2(ids=arr, memory=stage1_memory, self_pad=pad)
-            idx = sample_logits(logits[0, -1], temperature, [pad_id, bos_id])
+            forbidden = [pad_id, bos_id]
+            if len(generated) < min_tokens:
+                forbidden.append(eos_id)
+            idx = sample_logits(logits[0, -1], temperature, forbidden, top_k, top_p)
             if idx == eos_id:
                 break
             ids.append(idx)
@@ -360,6 +385,15 @@ def paths(args):
         "weights": out / "two_stage_generator.pt",
         "config": out / "config.json",
     }
+
+
+def resolve_artifact_path(saved_path, fallback_path):
+    saved = Path(saved_path)
+    if saved.exists():
+        return saved
+    if fallback_path.exists():
+        return fallback_path
+    return saved
 
 
 def train(args):
@@ -439,13 +473,15 @@ def infer(args):
     p = paths(args)
     device = pick_device(args.device)
     config = json.loads(p["config"].read_text(encoding="utf-8"))
-    tok = Tokenizer.from_file(config["tokeniser"])
+    tokeniser_path = resolve_artifact_path(config["tokeniser"], p["tokeniser"])
+    weights_path = resolve_artifact_path(config["weights"], p["weights"])
+    tok = Tokenizer.from_file(str(tokeniser_path))
     model_args = config_args(config)
     model = TwoStageGenerator(config["english_vocab"], model_args).to(device)
     try:
-        state = torch.load(config["weights"], map_location=device, weights_only=True)
+        state = torch.load(weights_path, map_location=device, weights_only=True)
     except TypeError:
-        state = torch.load(config["weights"], map_location=device)
+        state = torch.load(weights_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
     prompt = sys.stdin.read().strip()
@@ -453,15 +489,32 @@ def infer(args):
     if not prompt_ids:
         prompt_ids = [tok.token_to_id(BOS)]
     prompt_memory, prompt_pad = model.encode_prompt(prompt_ids, tok.token_to_id(PAD), device)
-    sanskrit, stage1_memory = model.generate_stage1(prompt_memory, prompt_pad, args.stage1_temperature)
+    stage1_infer_chars = args.stage1_infer_chars
+    if stage1_infer_chars is None:
+        stage1_infer_chars = min(model_args.stage1_chars, model_args.train_stage1_chars)
+    sanskrit, hard_stage1_memory = model.generate_stage1(
+        prompt_memory,
+        prompt_pad,
+        args.stage1_temperature,
+        stage1_infer_chars,
+        args.stage1_top_k,
+        args.stage1_top_p,
+    )
+    if args.soft_stage1_infer:
+        stage1_memory = model.soft_stage1_infer(prompt_memory, prompt_pad, stage1_infer_chars)
+    else:
+        stage1_memory = hard_stage1_memory
     english_ids = model.generate_stage2(
         prompt_ids,
         stage1_memory,
         args.stage2_temperature,
         args.infer_tokens,
+        args.min_infer_tokens,
         tok.token_to_id(PAD),
         tok.token_to_id(BOS),
         tok.token_to_id(EOS),
+        args.stage2_top_k,
+        args.stage2_top_p,
     )
     prose = tok.decode(english_ids)
     print(sanskrit)
@@ -495,14 +548,26 @@ def parse_args():
     parser.add_argument("--prompt-fraction", type=float, default=0.25)
     parser.add_argument("--stage1-temperature", type=float, default=1.1)
     parser.add_argument("--stage2-temperature", type=float, default=0.9)
+    parser.add_argument("--stage1-top-k", type=int, default=0)
+    parser.add_argument("--stage2-top-k", type=int, default=0)
+    parser.add_argument("--stage1-top-p", type=float, default=1.0)
+    parser.add_argument("--stage2-top-p", type=float, default=1.0)
+    parser.add_argument("--stage1-infer-chars", type=int)
+    parser.add_argument("--hard-stage1-infer", dest="soft_stage1_infer", action="store_false")
+    parser.set_defaults(soft_stage1_infer=True)
     parser.add_argument("--infer-tokens", type=int, default=200)
+    parser.add_argument("--min-infer-tokens", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--random-seed", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.random_seed:
+        args.seed = random.SystemRandom().randrange(2**31)
+        print(f"seed {args.seed}", file=sys.stderr)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
