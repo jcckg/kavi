@@ -1,0 +1,10 @@
+# macOS misc
+.DS_Store
+
+# Python / UV
+.venv/
+__pycache__/
+*.py[cod]
+
+# Training output
+artifacts/
