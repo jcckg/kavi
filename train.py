@@ -150,15 +150,7 @@ def sample_logits(logits, temperature, forbidden, top_k=0, top_p=1.0):
 
 class PromptEncoder(nn.Module):
     def __init__(
-        self,
-        vocab_size,
-        d_model,
-        heads,
-        d_ff,
-        layers,
-        max_len,
-        checkpoint_layers=False,
-        dropout=0.0,
+        self, vocab_size, d_model, heads, d_ff, layers, max_len, checkpoint_layers=False
     ):
         super().__init__()
         self.checkpoint_layers = checkpoint_layers
@@ -170,7 +162,7 @@ class PromptEncoder(nn.Module):
                     d_model=d_model,
                     nhead=heads,
                     dim_feedforward=d_ff,
-                    dropout=dropout,
+                    dropout=0.0,
                     activation="gelu",
                     batch_first=True,
                     norm_first=True,
@@ -196,15 +188,7 @@ class PromptEncoder(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(
-        self,
-        vocab_size,
-        d_model,
-        heads,
-        d_ff,
-        layers,
-        max_len,
-        checkpoint_layers=False,
-        dropout=0.0,
+        self, vocab_size, d_model, heads, d_ff, layers, max_len, checkpoint_layers=False
     ):
         super().__init__()
         self.checkpoint_layers = checkpoint_layers
@@ -216,7 +200,7 @@ class Decoder(nn.Module):
                     d_model=d_model,
                     nhead=heads,
                     dim_feedforward=d_ff,
-                    dropout=dropout,
+                    dropout=0.0,
                     activation="gelu",
                     batch_first=True,
                     norm_first=True,
@@ -266,37 +250,33 @@ class TwoStageGenerator(nn.Module):
         self.stage1_chars = args.stage1_chars
         self.train_stage1_chars = getattr(args, "train_stage1_chars", args.stage1_chars)
         checkpoint_layers = getattr(args, "checkpoint", False)
-        dropout = getattr(args, "dropout", 0.0)
         max_english = args.max_prompt_tokens + args.max_target_tokens + 2
         self.encoder = PromptEncoder(
             english_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            3,
+            2,
             args.max_prompt_tokens,
             checkpoint_layers,
-            dropout=dropout,
         )
         self.stage1 = Decoder(
             self.sanskrit_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            4,
+            3,
             args.stage1_chars + 1,
             checkpoint_layers,
-            dropout=dropout,
         )
         self.stage2 = Decoder(
             english_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            5,
+            3,
             max_english,
             checkpoint_layers,
-            dropout=dropout,
         )
 
     def soft_stage1(self, prompt_memory, prompt_pad):
@@ -642,15 +622,16 @@ def parse_args():
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.set_defaults(amp=True)
     parser.add_argument("--vocab-size", type=int, default=12000)
-    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--d-ff", type=int, default=2048)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--d-ff", type=int, default=512)
     parser.add_argument("--stage1-chars", type=int, default=160)
     parser.add_argument("--train-stage1-chars", type=int, default=160)
+    parser.add_argument("--warmup-steps", type=int, default=400)
     parser.add_argument("--max-prompt-tokens", type=int, default=64)
     parser.add_argument("--max-target-tokens", type=int, default=200)
     parser.add_argument("--prompt-fraction", type=float, default=0.25)
@@ -667,8 +648,6 @@ def parse_args():
     parser.set_defaults(soft_stage1_infer=True)
     parser.add_argument("--infer-tokens", type=int, default=200)
     parser.add_argument("--min-infer-tokens", type=int, default=0)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--warmup-steps", type=int, default=400)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--random-seed", action="store_true")
