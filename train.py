@@ -18,7 +18,6 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.trainers import BpeTrainer
 from torch.utils.checkpoint import checkpoint
 
-
 PAD = "<pad>"
 BOS = "<bos>"
 EOS = "<eos>"
@@ -44,7 +43,10 @@ def pick_device(name):
 def sinusoidal(max_len, d_model):
     pe = torch.zeros(max_len, d_model)
     pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-    div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+    div = torch.exp(
+        torch.arange(0, d_model, 2, dtype=torch.float32)
+        * (-math.log(10000.0) / d_model)
+    )
     pe[:, 0::2] = torch.sin(pos * div)
     pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
     return pe.unsqueeze(0)
@@ -54,7 +56,9 @@ def train_tokeniser(texts, vocab_size, path):
     tok = Tokenizer(BPE(unk_token=UNK))
     tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
     tok.decoder = ByteLevelDecoder()
-    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIALS, show_progress=True)
+    trainer = BpeTrainer(
+        vocab_size=vocab_size, special_tokens=SPECIALS, show_progress=True
+    )
     tok.train_from_iterator(texts, trainer=trainer)
     tok.save(str(path))
     return tok
@@ -82,7 +86,9 @@ def make_examples(texts, tok, args):
     examples = []
     for text in texts:
         ids = tok.encode(text).ids
-        item = split_ids(ids, args.prompt_fraction, args.max_prompt_tokens, args.max_target_tokens)
+        item = split_ids(
+            ids, args.prompt_fraction, args.max_prompt_tokens, args.max_target_tokens
+        )
         if item is not None:
             examples.append(item)
     return examples
@@ -116,7 +122,9 @@ def collate(batch, pad_id, bos_id, eos_id, device):
 
 
 def causal_mask(size, device):
-    return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
+    return torch.triu(
+        torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1
+    )
 
 
 def sample_logits(logits, temperature, forbidden, top_k=0, top_p=1.0):
@@ -125,7 +133,9 @@ def sample_logits(logits, temperature, forbidden, top_k=0, top_p=1.0):
     if top_k and top_k > 0:
         keep = min(top_k, values.numel())
         cutoff = torch.topk(values, keep).values[-1]
-        values = torch.where(values < cutoff, torch.full_like(values, -float("inf")), values)
+        values = torch.where(
+            values < cutoff, torch.full_like(values, -float("inf")), values
+        )
     if top_p < 1.0:
         sorted_values, sorted_indices = torch.sort(values, descending=True)
         sorted_probs = F.softmax(sorted_values, dim=-1)
@@ -139,7 +149,17 @@ def sample_logits(logits, temperature, forbidden, top_k=0, top_p=1.0):
 
 
 class PromptEncoder(nn.Module):
-    def __init__(self, vocab_size, d_model, heads, d_ff, layers, max_len, checkpoint_layers=False):
+    def __init__(
+        self,
+        vocab_size,
+        d_model,
+        heads,
+        d_ff,
+        layers,
+        max_len,
+        checkpoint_layers=False,
+        dropout=0.0,
+    ):
         super().__init__()
         self.checkpoint_layers = checkpoint_layers
         self.embed = nn.Embedding(vocab_size, d_model)
@@ -150,7 +170,7 @@ class PromptEncoder(nn.Module):
                     d_model=d_model,
                     nhead=heads,
                     dim_feedforward=d_ff,
-                    dropout=0.0,
+                    dropout=dropout,
                     activation="gelu",
                     batch_first=True,
                     norm_first=True,
@@ -164,8 +184,10 @@ class PromptEncoder(nn.Module):
         x = self.embed(ids) + self.pos[:, : ids.shape[1]].to(ids.device)
         for layer in self.layers:
             if self.checkpoint_layers and self.training:
+
                 def run(y):
                     return layer(y, src_key_padding_mask=pad_mask)
+
                 x = checkpoint(run, x, use_reentrant=False)
             else:
                 x = layer(x, src_key_padding_mask=pad_mask)
@@ -173,7 +195,17 @@ class PromptEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, d_model, heads, d_ff, layers, max_len, checkpoint_layers=False):
+    def __init__(
+        self,
+        vocab_size,
+        d_model,
+        heads,
+        d_ff,
+        layers,
+        max_len,
+        checkpoint_layers=False,
+        dropout=0.0,
+    ):
         super().__init__()
         self.checkpoint_layers = checkpoint_layers
         self.embed = nn.Embedding(vocab_size, d_model)
@@ -184,7 +216,7 @@ class Decoder(nn.Module):
                     d_model=d_model,
                     nhead=heads,
                     dim_feedforward=d_ff,
-                    dropout=0.0,
+                    dropout=dropout,
                     activation="gelu",
                     batch_first=True,
                     norm_first=True,
@@ -195,12 +227,15 @@ class Decoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, ids=None, embeds=None, memory=None, self_pad=None, memory_pad=None):
+    def forward(
+        self, ids=None, embeds=None, memory=None, self_pad=None, memory_pad=None
+    ):
         x = self.embed(ids) if embeds is None else embeds
         x = x + self.pos[:, : x.shape[1]].to(x.device)
         mask = causal_mask(x.shape[1], x.device)
         for layer in self.layers:
             if self.checkpoint_layers and self.training:
+
                 def run(y, mem):
                     return layer(
                         y,
@@ -209,6 +244,7 @@ class Decoder(nn.Module):
                         tgt_key_padding_mask=self_pad,
                         memory_key_padding_mask=memory_pad,
                     )
+
                 x = checkpoint(run, x, memory, use_reentrant=False)
             else:
                 x = layer(
@@ -230,42 +266,50 @@ class TwoStageGenerator(nn.Module):
         self.stage1_chars = args.stage1_chars
         self.train_stage1_chars = getattr(args, "train_stage1_chars", args.stage1_chars)
         checkpoint_layers = getattr(args, "checkpoint", False)
+        dropout = getattr(args, "dropout", 0.0)
         max_english = args.max_prompt_tokens + args.max_target_tokens + 2
         self.encoder = PromptEncoder(
             english_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            2,
+            3,
             args.max_prompt_tokens,
             checkpoint_layers,
+            dropout=dropout,
         )
         self.stage1 = Decoder(
             self.sanskrit_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            3,
+            4,
             args.stage1_chars + 1,
             checkpoint_layers,
+            dropout=dropout,
         )
         self.stage2 = Decoder(
             english_vocab,
             args.d_model,
             args.heads,
             args.d_ff,
-            3,
+            5,
             max_english,
             checkpoint_layers,
+            dropout=dropout,
         )
 
     def soft_stage1(self, prompt_memory, prompt_pad):
         b = prompt_memory.shape[0]
-        ids = torch.full((b, 1), SANSKRIT_BOS, dtype=torch.long, device=prompt_memory.device)
+        ids = torch.full(
+            (b, 1), SANSKRIT_BOS, dtype=torch.long, device=prompt_memory.device
+        )
         embeds = self.stage1.embed(ids)
         states = []
         for _ in range(self.train_stage1_chars):
-            hidden, logits = self.stage1(embeds=embeds, memory=prompt_memory, memory_pad=prompt_pad)
+            hidden, logits = self.stage1(
+                embeds=embeds, memory=prompt_memory, memory_pad=prompt_pad
+            )
             last_hidden = hidden[:, -1:, :]
             probs = F.softmax(logits[:, -1, :], dim=-1)
             next_embed = probs @ self.stage1.embed.weight
@@ -293,19 +337,31 @@ class TwoStageGenerator(nn.Module):
     @torch.no_grad()
     def encode_prompt(self, prompt_ids, pad_id, device):
         ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        pad = torch.tensor([[x == pad_id for x in prompt_ids]], dtype=torch.bool, device=device)
+        pad = torch.tensor(
+            [[x == pad_id for x in prompt_ids]], dtype=torch.bool, device=device
+        )
         return self.encoder(ids, pad), pad
 
     @torch.no_grad()
-    def generate_stage1(self, prompt_memory, prompt_pad, temperature, max_chars=None, top_k=0, top_p=1.0):
+    def generate_stage1(
+        self, prompt_memory, prompt_pad, temperature, max_chars=None, top_k=0, top_p=1.0
+    ):
         ids = [SANSKRIT_BOS]
         chars = []
         states = []
-        limit = self.stage1_chars if max_chars is None else min(max_chars, self.stage1_chars)
+        limit = (
+            self.stage1_chars
+            if max_chars is None
+            else min(max_chars, self.stage1_chars)
+        )
         for _ in range(limit):
             arr = torch.tensor([ids], dtype=torch.long, device=prompt_memory.device)
-            hidden, logits = self.stage1(ids=arr, memory=prompt_memory, memory_pad=prompt_pad)
-            idx = sample_logits(logits[0, -1], temperature, [SANSKRIT_PAD, SANSKRIT_BOS], top_k, top_p)
+            hidden, logits = self.stage1(
+                ids=arr, memory=prompt_memory, memory_pad=prompt_pad
+            )
+            idx = sample_logits(
+                logits[0, -1], temperature, [SANSKRIT_PAD, SANSKRIT_BOS], top_k, top_p
+            )
             states.append(hidden[:, -1:, :])
             if idx == SANSKRIT_EOS:
                 break
@@ -313,8 +369,12 @@ class TwoStageGenerator(nn.Module):
             if idx >= SANSKRIT_OFFSET:
                 chars.append(DEVANAGARI[idx - SANSKRIT_OFFSET])
         if not states:
-            arr = torch.tensor([[SANSKRIT_BOS]], dtype=torch.long, device=prompt_memory.device)
-            states.append(self.stage1(ids=arr, memory=prompt_memory, memory_pad=prompt_pad)[0])
+            arr = torch.tensor(
+                [[SANSKRIT_BOS]], dtype=torch.long, device=prompt_memory.device
+            )
+            states.append(
+                self.stage1(ids=arr, memory=prompt_memory, memory_pad=prompt_pad)[0]
+            )
         return "".join(chars), torch.cat(states, dim=1)
 
     @torch.no_grad()
@@ -327,12 +387,28 @@ class TwoStageGenerator(nn.Module):
             self.train_stage1_chars = old_len
 
     @torch.no_grad()
-    def generate_stage2(self, prompt_ids, stage1_memory, temperature, max_tokens, min_tokens, pad_id, bos_id, eos_id, top_k=0, top_p=1.0):
+    def generate_stage2(
+        self,
+        prompt_ids,
+        stage1_memory,
+        temperature,
+        max_tokens,
+        min_tokens,
+        pad_id,
+        bos_id,
+        eos_id,
+        top_k=0,
+        top_p=1.0,
+    ):
         ids = [bos_id] + prompt_ids
         generated = []
         for _ in range(max_tokens):
             arr = torch.tensor([ids], dtype=torch.long, device=stage1_memory.device)
-            pad = torch.tensor([[x == pad_id for x in ids]], dtype=torch.bool, device=stage1_memory.device)
+            pad = torch.tensor(
+                [[x == pad_id for x in ids]],
+                dtype=torch.bool,
+                device=stage1_memory.device,
+            )
             _, logits = self.stage2(ids=arr, memory=stage1_memory, self_pad=pad)
             forbidden = [pad_id, bos_id]
             if len(generated) < min_tokens:
@@ -407,7 +483,9 @@ def train(args):
     if args.checkpoint:
         print("Activation checkpointing: on")
     if args.train_stage1_chars != args.stage1_chars:
-        print(f"Training Stage 1 unroll: {args.train_stage1_chars} chars; inference max: {args.stage1_chars} chars")
+        print(
+            f"Training Stage 1 unroll: {args.train_stage1_chars} chars; inference max: {args.stage1_chars} chars"
+        )
     print("Loading rahular/itihasa...")
     ds = load_dataset(args.dataset, trust_remote_code=True)
     train_text = list(english_texts(ds["train"]))
@@ -425,6 +503,18 @@ def train(args):
     if args.compile and device.type != "mps":
         model = torch.compile(model)
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
+    total_steps = args.epochs * math.ceil(
+        len(examples) / (args.batch_size * args.grad_accum_steps)
+    )
+    warmup = args.warmup_steps
+
+    def lr_lambda(step):
+        if step < warmup:
+            return step / max(1, warmup)
+        progress = (step - warmup) / max(1, total_steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     for epoch in range(1, args.epochs + 1):
@@ -438,7 +528,13 @@ def train(args):
             torch.cuda.reset_peak_memory_stats()
         optimiser.zero_grad(set_to_none=True)
         for start in range(0, len(examples), args.batch_size):
-            batch = collate(examples[start : start + args.batch_size], pad_id, bos_id, eos_id, device)
+            batch = collate(
+                examples[start : start + args.batch_size],
+                pad_id,
+                bos_id,
+                eos_id,
+                device,
+            )
             if device.type == "cuda":
                 with torch.amp.autocast("cuda", enabled=args.amp):
                     loss = model(batch)
@@ -448,10 +544,14 @@ def train(args):
             scaler.scale(scaled_loss).backward()
             total += float(loss.detach().cpu())
             steps += 1
-            should_step = steps % args.grad_accum_steps == 0 or start + args.batch_size >= len(examples)
+            should_step = (
+                steps % args.grad_accum_steps == 0
+                or start + args.batch_size >= len(examples)
+            )
             if should_step:
                 scaler.step(optimiser)
                 scaler.update()
+                scheduler.step()
                 optimiser.zero_grad(set_to_none=True)
                 updates += 1
             if steps % args.log_every == 0:
@@ -459,10 +559,14 @@ def train(args):
                 ex_per_sec = min(steps * args.batch_size, len(examples)) / elapsed
                 mem = ""
                 if device.type == "cuda":
-                    mem = f" peak_cuda {torch.cuda.max_memory_allocated() / 1024 ** 3:.2f}GB"
-                print(f"epoch {epoch} step {steps} update {updates} loss {total / steps:.4f} {ex_per_sec:.1f} ex/s{mem}")
+                    mem = f" peak_cuda {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB"
+                print(
+                    f"epoch {epoch} step {steps} update {updates} loss {total / steps:.4f} lr {scheduler.get_last_lr()[0]:.2e} {ex_per_sec:.1f} ex/s{mem}"
+                )
         elapsed = max(time.time() - epoch_start, 1e-9)
-        print(f"epoch {epoch} loss {total / max(steps, 1):.4f} updates {updates} time {elapsed / 60:.1f} min")
+        print(
+            f"epoch {epoch} loss {total / max(steps, 1):.4f} updates {updates} time {elapsed / 60:.1f} min"
+        )
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         torch.save(raw_model.state_dict(), p["weights"])
         save_config(args, tok.get_vocab_size(), p)
@@ -488,7 +592,9 @@ def infer(args):
     prompt_ids = tok.encode(prompt).ids[-model_args.max_prompt_tokens :]
     if not prompt_ids:
         prompt_ids = [tok.token_to_id(BOS)]
-    prompt_memory, prompt_pad = model.encode_prompt(prompt_ids, tok.token_to_id(PAD), device)
+    prompt_memory, prompt_pad = model.encode_prompt(
+        prompt_ids, tok.token_to_id(PAD), device
+    )
     stage1_infer_chars = args.stage1_infer_chars
     if stage1_infer_chars is None:
         stage1_infer_chars = min(model_args.stage1_chars, model_args.train_stage1_chars)
@@ -501,7 +607,9 @@ def infer(args):
         args.stage1_top_p,
     )
     if args.soft_stage1_infer:
-        stage1_memory = model.soft_stage1_infer(prompt_memory, prompt_pad, stage1_infer_chars)
+        stage1_memory = model.soft_stage1_infer(
+            prompt_memory, prompt_pad, stage1_infer_chars
+        )
     else:
         stage1_memory = hard_stage1_memory
     english_ids = model.generate_stage2(
@@ -533,16 +641,16 @@ def parse_args():
     parser.add_argument("--checkpoint", action="store_true")
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.set_defaults(amp=True)
-    parser.add_argument("--vocab-size", type=int, default=8000)
-    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--vocab-size", type=int, default=12000)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--d-ff", type=int, default=512)
-    parser.add_argument("--stage1-chars", type=int, default=100)
-    parser.add_argument("--train-stage1-chars", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--d-model", type=int, default=512)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--d-ff", type=int, default=2048)
+    parser.add_argument("--stage1-chars", type=int, default=160)
+    parser.add_argument("--train-stage1-chars", type=int, default=160)
     parser.add_argument("--max-prompt-tokens", type=int, default=64)
     parser.add_argument("--max-target-tokens", type=int, default=200)
     parser.add_argument("--prompt-fraction", type=float, default=0.25)
@@ -553,10 +661,14 @@ def parse_args():
     parser.add_argument("--stage1-top-p", type=float, default=1.0)
     parser.add_argument("--stage2-top-p", type=float, default=1.0)
     parser.add_argument("--stage1-infer-chars", type=int)
-    parser.add_argument("--hard-stage1-infer", dest="soft_stage1_infer", action="store_false")
+    parser.add_argument(
+        "--hard-stage1-infer", dest="soft_stage1_infer", action="store_false"
+    )
     parser.set_defaults(soft_stage1_infer=True)
     parser.add_argument("--infer-tokens", type=int, default=200)
     parser.add_argument("--min-infer-tokens", type=int, default=0)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--warmup-steps", type=int, default=400)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--random-seed", action="store_true")
