@@ -33,6 +33,8 @@ Kavi’s video renderer visualises the model’s generative trajectory by projec
 hidden states into three-dimensional space and deforming the resulting geometry according 
 to activation, attention, disagreement, and token entropy.
 
+https://github.com/user-attachments/assets/95433869-6389-4200-88e3-5f9f0839a2bc
+
 Common output controls:
 
 ``` sh
