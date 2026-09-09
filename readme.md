@@ -1,43 +1,56 @@
 # kavi
 
-Two-stage autoregressive prose generator in PyTorch.
+Kavi is a two-stage autoregressive prose generator implemented in PyTorch. 
+It encodes an English prompt, generates an intermediate character-level 
+latent sequence constrained to the Devanagari alphabet, and conditions an 
+English BPE decoder on the resulting representation to generate prose. 
+
+The model is trained on the English Dutt translations from `rahular/itihasa`, 
+using a learned BPE tokeniser, a prompt encoder, and two autoregressive decoders. 
+CUDA is used when available, followed by MPS and CPU.
+
+### Setup -> Inference
 
 ```sh
-uv run --with torch --with 'datasets<4' --with tokenizers python train.py
+uv sync
+uv run kavi train --batch-size 128 --train-stage1-chars 32 # (or train w/ the colab notebook)
+uv run kavi infer "The king entered the forest" # (add --random-seed for random samples per run)
 ```
 
-The script loads `rahular/itihasa` from Hugging Face, uses Devanagari character
-ids for Sanskrit, trains an 8,000 item BPE tokeniser on the English Dutt
-translations, and trains a small prompt encoder plus two autoregressive
-decoders for 4 epochs. CUDA is used when available, then MPS, then CPU.
-
-Sample after training:
+For longer generation:
 
 ```sh
-printf "The king entered the forest" | uv run --with torch --with 'datasets<4' --with tokenizers python train.py --infer-only
+uv run kavi infer "The king entered the forest" --stage1-infer-chars 32 --infer-tokens 300 --min-infer-tokens 60
 ```
-
-Longer inference:
-
-```sh
-printf "The king entered the forest" | uv run --with torch --with 'datasets<4' --with tokenizers python train.py --infer-only --stage1-infer-chars 32 --infer-tokens 300 --min-infer-tokens 60
-```
-
-More conservative sampling:
-
-```sh
-printf "Krishna" | uv run --with torch --with 'datasets<4' --with tokenizers python train.py --infer-only --out-dir artifacts --stage1-infer-chars 32 --stage2-temperature 0.65 --stage2-top-k 40 --infer-tokens 220
-```
-
-Different random sample:
-
-```sh
-printf "Krishna" | uv run --with torch --with 'datasets<4' --with tokenizers python train.py --infer-only --out-dir artifacts --random-seed
-```
-
-For Colab, choose a GPU runtime and run the same command. Add `--compile` on CUDA
-if the session has enough time for the first compilation pass.
 
 The included `kavi_colab.ipynb` runs the faster CUDA training path with
 `--batch-size 128 --grad-accum-steps 1 --train-stage1-chars 32`, and saves
 artefacts to Google Drive.
+
+### Video Rendering
+
+Kavi’s video renderer visualises the model’s generative trajectory by projecting 
+hidden states into three-dimensional space and deforming the resulting geometry according 
+to activation, attention, disagreement, and token entropy.
+
+Common output controls:
+
+``` sh
+uv run kavi render "The king entered the forest" \
+    --video-out kavi.mp4 \
+    --width 1920 \
+    --height 1080 \
+    --fps 24 \
+    --crf 15
+```
+
+Geometry and motion can be adjusted with:
+
+- --extent — overall scale of the hidden-state object.
+- --base-z-scale — depth assigned to the third principal component.
+- --knn-k — semantic neighbours connected per hidden-state vertex.
+- --activation-expand and --activation-lift — deformation driven by current activation.
+- --fracture-gain — separation introduced by attention disagreement and entropy.
+- --fov, --camera-distance, and --elevation — camera composition.
+- --azimuth-drift — gradual camera rotation between model states.
+- --temporal-inertia — persistence of geometry across frames.
