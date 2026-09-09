@@ -1,0 +1,23 @@
+[project]
+name = "kavi"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets==5.0.1",
+    "matplotlib",
+    "moderngl",
+    "numpy",
+    "pillow",
+    "tokenizers==0.23.2",
+    "torch",
+]
+
+[project.scripts]
+kavi = "cli:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli", "train", "render"]
