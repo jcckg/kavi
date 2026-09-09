@@ -41,53 +41,58 @@ def pick_device(name):
 
 
 def sinusoidal(max_len, d_model):
-    pe = torch.zeros(max_len, d_model)
-    pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-    div = torch.exp(
+    encoding = torch.zeros(max_len, d_model)
+    positions = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+    frequencies = torch.exp(
         torch.arange(0, d_model, 2, dtype=torch.float32)
         * (-math.log(10000.0) / d_model)
     )
-    pe[:, 0::2] = torch.sin(pos * div)
-    pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
-    return pe.unsqueeze(0)
+    encoding[:, 0::2] = torch.sin(positions * frequencies)
+    encoding[:, 1::2] = torch.cos(
+        positions * frequencies[: encoding[:, 1::2].shape[1]]
+    )
+    return encoding.unsqueeze(0)
 
 
 def train_tokeniser(texts, vocab_size, path):
-    tok = Tokenizer(BPE(unk_token=UNK))
-    tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
-    tok.decoder = ByteLevelDecoder()
+    tokeniser = Tokenizer(BPE(unk_token=UNK))
+    tokeniser.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tokeniser.decoder = ByteLevelDecoder()
     trainer = BpeTrainer(
         vocab_size=vocab_size, special_tokens=SPECIALS, show_progress=True
     )
-    tok.train_from_iterator(texts, trainer=trainer)
-    tok.save(str(path))
-    return tok
+    tokeniser.train_from_iterator(texts, trainer=trainer)
+    tokeniser.save(str(path))
+    return tokeniser
 
 
-def english_texts(split):
-    for row in split:
+def english_texts(dataset_split):
+    for row in dataset_split:
         text = row["translation"]["en"].strip()
         if text:
             yield text
 
 
-def split_ids(ids, prompt_fraction, max_prompt_tokens, max_target_tokens):
-    if len(ids) < 2:
+def split_ids(token_ids, prompt_fraction, max_prompt_tokens, max_target_tokens):
+    if len(token_ids) < 2:
         return None
-    prompt_len = max(1, int(len(ids) * prompt_fraction))
-    prompt_len = min(prompt_len, max_prompt_tokens, len(ids) - 1)
-    target = ids[prompt_len : prompt_len + max_target_tokens]
+    prompt_len = max(1, int(len(token_ids) * prompt_fraction))
+    prompt_len = min(prompt_len, max_prompt_tokens, len(token_ids) - 1)
+    target = token_ids[prompt_len : prompt_len + max_target_tokens]
     if not target:
         return None
-    return ids[:prompt_len], target
+    return token_ids[:prompt_len], target
 
 
-def make_examples(texts, tok, args):
+def make_examples(texts, tokeniser, args):
     examples = []
     for text in texts:
-        ids = tok.encode(text).ids
+        token_ids = tokeniser.encode(text).ids
         item = split_ids(
-            ids, args.prompt_fraction, args.max_prompt_tokens, args.max_target_tokens
+            token_ids,
+            args.prompt_fraction,
+            args.max_prompt_tokens,
+            args.max_target_tokens,
         )
         if item is not None:
             examples.append(item)
@@ -97,25 +102,25 @@ def make_examples(texts, tok, args):
 def collate(batch, pad_id, bos_id, eos_id, device):
     batch_size = len(batch)
     max_prompt = max(len(x[0]) for x in batch)
-    max_dec = max(1 + len(prompt) + len(target) for prompt, target in batch)
+    max_decoder = max(1 + len(prompt) + len(target) for prompt, target in batch)
     prompts = np.full((batch_size, max_prompt), pad_id, dtype=np.int64)
-    dec_inputs = np.full((batch_size, max_dec), pad_id, dtype=np.int64)
-    targets = np.full((batch_size, max_dec), pad_id, dtype=np.int64)
-    loss_mask = np.zeros((batch_size, max_dec), dtype=np.float32)
-    for i, (prompt, target) in enumerate(batch):
+    decoder_inputs = np.full((batch_size, max_decoder), pad_id, dtype=np.int64)
+    targets = np.full((batch_size, max_decoder), pad_id, dtype=np.int64)
+    loss_mask = np.zeros((batch_size, max_decoder), dtype=np.float32)
+    for index, (prompt, target) in enumerate(batch):
         prompt = list(prompt)
         target = list(target)
-        prompts[i, : len(prompt)] = prompt
-        dec_in = [bos_id] + prompt + target
-        dec_tgt = prompt + target + [eos_id]
-        dec_inputs[i, : len(dec_in)] = dec_in
-        targets[i, : len(dec_tgt)] = dec_tgt
-        loss_mask[i, len(prompt) : len(dec_tgt)] = 1.0
+        prompts[index, : len(prompt)] = prompt
+        decoder_input = [bos_id] + prompt + target
+        decoder_target = prompt + target + [eos_id]
+        decoder_inputs[index, : len(decoder_input)] = decoder_input
+        targets[index, : len(decoder_target)] = decoder_target
+        loss_mask[index, len(prompt) : len(decoder_target)] = 1.0
     return {
         "prompt": torch.tensor(prompts, device=device),
         "prompt_pad": torch.tensor(prompts == pad_id, device=device),
-        "dec_input": torch.tensor(dec_inputs, device=device),
-        "dec_pad": torch.tensor(dec_inputs == pad_id, device=device),
+        "dec_input": torch.tensor(decoder_inputs, device=device),
+        "dec_pad": torch.tensor(decoder_inputs == pad_id, device=device),
         "target": torch.tensor(targets, device=device),
         "loss_mask": torch.tensor(loss_mask, device=device),
     }
@@ -280,9 +285,12 @@ class TwoStageGenerator(nn.Module):
         )
 
     def soft_stage1(self, prompt_memory, prompt_pad):
-        b = prompt_memory.shape[0]
+        batch_size = prompt_memory.shape[0]
         ids = torch.full(
-            (b, 1), SANSKRIT_BOS, dtype=torch.long, device=prompt_memory.device
+            (batch_size, 1),
+            SANSKRIT_BOS,
+            dtype=torch.long,
+            device=prompt_memory.device,
         )
         embeds = self.stage1.embed(ids)
         states = []
@@ -335,9 +343,11 @@ class TwoStageGenerator(nn.Module):
             else min(max_chars, self.stage1_chars)
         )
         for _ in range(limit):
-            arr = torch.tensor([ids], dtype=torch.long, device=prompt_memory.device)
+            token_ids = torch.tensor(
+                [ids], dtype=torch.long, device=prompt_memory.device
+            )
             hidden, logits = self.stage1(
-                ids=arr, memory=prompt_memory, memory_pad=prompt_pad
+                ids=token_ids, memory=prompt_memory, memory_pad=prompt_pad
             )
             idx = sample_logits(
                 logits[0, -1], temperature, [SANSKRIT_PAD, SANSKRIT_BOS], top_k, top_p
@@ -349,11 +359,13 @@ class TwoStageGenerator(nn.Module):
             if idx >= SANSKRIT_OFFSET:
                 chars.append(DEVANAGARI[idx - SANSKRIT_OFFSET])
         if not states:
-            arr = torch.tensor(
+            token_ids = torch.tensor(
                 [[SANSKRIT_BOS]], dtype=torch.long, device=prompt_memory.device
             )
             states.append(
-                self.stage1(ids=arr, memory=prompt_memory, memory_pad=prompt_pad)[0]
+                self.stage1(
+                    ids=token_ids, memory=prompt_memory, memory_pad=prompt_pad
+                )[0]
             )
         return "".join(chars), torch.cat(states, dim=1)
 
@@ -383,13 +395,17 @@ class TwoStageGenerator(nn.Module):
         ids = [bos_id] + prompt_ids
         generated = []
         for _ in range(max_tokens):
-            arr = torch.tensor([ids], dtype=torch.long, device=stage1_memory.device)
+            token_ids = torch.tensor(
+                [ids], dtype=torch.long, device=stage1_memory.device
+            )
             pad = torch.tensor(
                 [[x == pad_id for x in ids]],
                 dtype=torch.bool,
                 device=stage1_memory.device,
             )
-            _, logits = self.stage2(ids=arr, memory=stage1_memory, self_pad=pad)
+            _, logits = self.stage2(
+                ids=token_ids, memory=stage1_memory, self_pad=pad
+            )
             forbidden = [pad_id, bos_id]
             if len(generated) < min_tokens:
                 forbidden.append(eos_id)
@@ -419,17 +435,19 @@ def save_config(args, english_vocab, paths):
 
 
 def config_args(config):
-    ns = argparse.Namespace()
-    ns.vocab_size = config["vocab_size"]
-    ns.d_model = config["d_model"]
-    ns.heads = config["heads"]
-    ns.d_ff = config["d_ff"]
-    ns.stage1_chars = config["stage1_chars"]
-    ns.train_stage1_chars = config.get("train_stage1_chars", config["stage1_chars"])
-    ns.max_prompt_tokens = config["max_prompt_tokens"]
-    ns.max_target_tokens = config["max_target_tokens"]
-    ns.checkpoint = False
-    return ns
+    namespace = argparse.Namespace()
+    namespace.vocab_size = config["vocab_size"]
+    namespace.d_model = config["d_model"]
+    namespace.heads = config["heads"]
+    namespace.d_ff = config["d_ff"]
+    namespace.stage1_chars = config["stage1_chars"]
+    namespace.train_stage1_chars = config.get(
+        "train_stage1_chars", config["stage1_chars"]
+    )
+    namespace.max_prompt_tokens = config["max_prompt_tokens"]
+    namespace.max_target_tokens = config["max_target_tokens"]
+    namespace.checkpoint = False
+    return namespace
 
 
 def paths(args):
@@ -452,8 +470,18 @@ def resolve_artifact_path(saved_path, fallback_path):
     return saved
 
 
+def build_scheduler(optimiser, total_steps, warmup_steps):
+    def learning_rate_multiplier(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimiser, learning_rate_multiplier)
+
+
 def train(args):
-    p = paths(args)
+    artifact_paths = paths(args)
     device = pick_device(args.device)
     if args.train_stage1_chars < 1 or args.train_stage1_chars > args.stage1_chars:
         raise ValueError("--train-stage1-chars must be between 1 and --stage1-chars")
@@ -464,37 +492,32 @@ def train(args):
         print("Activation checkpointing: on")
     if args.train_stage1_chars != args.stage1_chars:
         print(
-            f"Training Stage 1 unroll: {args.train_stage1_chars} chars; inference max: {args.stage1_chars} chars"
+            f"Training stage 1 unroll: {args.train_stage1_chars} chars; "
+            f"inference maximum: {args.stage1_chars} chars"
         )
-    print("Loading rahular/itihasa...")
-    ds = load_dataset(args.dataset, trust_remote_code=True)
-    train_text = list(english_texts(ds["train"]))
-    if p["tokeniser"].exists() and not args.retrain_tokeniser:
-        tok = Tokenizer.from_file(str(p["tokeniser"]))
+    print(f"Loading {args.dataset}...")
+    dataset = load_dataset(args.dataset, trust_remote_code=True)
+    training_text = list(english_texts(dataset["train"]))
+    if artifact_paths["tokeniser"].exists() and not args.retrain_tokeniser:
+        tokeniser = Tokenizer.from_file(str(artifact_paths["tokeniser"]))
     else:
         print("Training English BPE tokeniser...")
-        tok = train_tokeniser(train_text, args.vocab_size, p["tokeniser"])
-    pad_id = tok.token_to_id(PAD)
-    bos_id = tok.token_to_id(BOS)
-    eos_id = tok.token_to_id(EOS)
-    examples = make_examples(train_text, tok, args)
+        tokeniser = train_tokeniser(
+            training_text, args.vocab_size, artifact_paths["tokeniser"]
+        )
+    pad_id = tokeniser.token_to_id(PAD)
+    bos_id = tokeniser.token_to_id(BOS)
+    eos_id = tokeniser.token_to_id(EOS)
+    examples = make_examples(training_text, tokeniser, args)
     print(f"Training examples: {len(examples):,}")
-    model = TwoStageGenerator(tok.get_vocab_size(), args).to(device)
+    model = TwoStageGenerator(tokeniser.get_vocab_size(), args).to(device)
     if args.compile and device.type != "mps":
         model = torch.compile(model)
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
     total_steps = args.epochs * math.ceil(
         len(examples) / (args.batch_size * args.grad_accum_steps)
     )
-    warmup = args.warmup_steps
-
-    def lr_lambda(step):
-        if step < warmup:
-            return step / max(1, warmup)
-        progress = (step - warmup) / max(1, total_steps - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda)
+    scheduler = build_scheduler(optimiser, total_steps, args.warmup_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     for epoch in range(1, args.epochs + 1):
@@ -537,29 +560,38 @@ def train(args):
             if steps % args.log_every == 0:
                 elapsed = max(time.time() - epoch_start, 1e-9)
                 ex_per_sec = min(steps * args.batch_size, len(examples)) / elapsed
-                mem = ""
+                memory_status = ""
                 if device.type == "cuda":
-                    mem = f" peak_cuda {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB"
+                    peak_memory = torch.cuda.max_memory_allocated() / 1024**3
+                    memory_status = f" peak_cuda {peak_memory:.2f}GB"
+                mean_loss = total / steps
+                learning_rate = scheduler.get_last_lr()[0]
                 print(
-                    f"epoch {epoch} step {steps} update {updates} loss {total / steps:.4f} lr {scheduler.get_last_lr()[0]:.2e} {ex_per_sec:.1f} ex/s{mem}"
+                    f"epoch {epoch} step {steps} update {updates} "
+                    f"loss {mean_loss:.4f} lr {learning_rate:.2e} "
+                    f"{ex_per_sec:.1f} ex/s{memory_status}"
                 )
         elapsed = max(time.time() - epoch_start, 1e-9)
+        mean_loss = total / max(steps, 1)
         print(
-            f"epoch {epoch} loss {total / max(steps, 1):.4f} updates {updates} time {elapsed / 60:.1f} min"
+            f"epoch {epoch} loss {mean_loss:.4f} updates {updates} "
+            f"time {elapsed / 60:.1f} min"
         )
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-        torch.save(raw_model.state_dict(), p["weights"])
-        save_config(args, tok.get_vocab_size(), p)
-    print(f"Saved weights to {p['weights']}")
+        torch.save(raw_model.state_dict(), artifact_paths["weights"])
+        save_config(args, tokeniser.get_vocab_size(), artifact_paths)
+    print(f"Saved weights to {artifact_paths['weights']}")
 
 
 def infer(args):
-    p = paths(args)
+    artifact_paths = paths(args)
     device = pick_device(args.device)
-    config = json.loads(p["config"].read_text(encoding="utf-8"))
-    tokeniser_path = resolve_artifact_path(config["tokeniser"], p["tokeniser"])
-    weights_path = resolve_artifact_path(config["weights"], p["weights"])
-    tok = Tokenizer.from_file(str(tokeniser_path))
+    config = json.loads(artifact_paths["config"].read_text(encoding="utf-8"))
+    tokeniser_path = resolve_artifact_path(
+        config["tokeniser"], artifact_paths["tokeniser"]
+    )
+    weights_path = resolve_artifact_path(config["weights"], artifact_paths["weights"])
+    tokeniser = Tokenizer.from_file(str(tokeniser_path))
     model_args = config_args(config)
     model = TwoStageGenerator(config["english_vocab"], model_args).to(device)
     try:
@@ -569,11 +601,11 @@ def infer(args):
     model.load_state_dict(state)
     model.eval()
     prompt = sys.stdin.read().strip()
-    prompt_ids = tok.encode(prompt).ids[-model_args.max_prompt_tokens :]
+    prompt_ids = tokeniser.encode(prompt).ids[-model_args.max_prompt_tokens :]
     if not prompt_ids:
-        prompt_ids = [tok.token_to_id(BOS)]
+        prompt_ids = [tokeniser.token_to_id(BOS)]
     prompt_memory, prompt_pad = model.encode_prompt(
-        prompt_ids, tok.token_to_id(PAD), device
+        prompt_ids, tokeniser.token_to_id(PAD), device
     )
     stage1_infer_chars = args.stage1_infer_chars
     if stage1_infer_chars is None:
@@ -598,13 +630,13 @@ def infer(args):
         args.stage2_temperature,
         args.infer_tokens,
         args.min_infer_tokens,
-        tok.token_to_id(PAD),
-        tok.token_to_id(BOS),
-        tok.token_to_id(EOS),
+        tokeniser.token_to_id(PAD),
+        tokeniser.token_to_id(BOS),
+        tokeniser.token_to_id(EOS),
         args.stage2_top_k,
         args.stage2_top_p,
     )
-    prose = tok.decode(english_ids)
+    prose = tokeniser.decode(english_ids)
     print(sanskrit)
     print()
     print(prose.strip())
