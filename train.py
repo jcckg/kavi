@@ -496,7 +496,7 @@ def train(args):
             f"inference maximum: {args.stage1_chars} chars"
         )
     print(f"Loading {args.dataset}...")
-    dataset = load_dataset(args.dataset, trust_remote_code=True)
+    dataset = load_dataset(args.dataset)
     training_text = list(english_texts(dataset["train"]))
     if artifact_paths["tokeniser"].exists() and not args.retrain_tokeniser:
         tokeniser = Tokenizer.from_file(str(artifact_paths["tokeniser"]))
